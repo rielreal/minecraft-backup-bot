@@ -1,0 +1,14 @@
+[Unit]
+Description=Minecraft Discord Backup Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/mcbot
+EnvironmentFile=/root/mcbot/.env
+ExecStart=/root/mcbot/venv/bin/python /root/mcbot/bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
