@@ -28,12 +28,21 @@ BACKUP_DIR = (BASE / "backups") if BACKUP_MODE == "builtin" else WATCH_DIR
 STATE_FILE = BASE / "state.json"
 TMP = BASE / "tmp"
 
-CONFIG_TARGETS = [t for t in os.environ.get(
+ANSI = re.compile(r"\x1b\[[0-9;]*m|§.")
+SPARK_URL = re.compile(r"https://spark\.lucko\.me/(?!docs)\S+")
+
+
+def csv_list(value):
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+CONFIG_TARGETS = csv_list(os.environ.get(
     "CONFIG_TARGETS", "config,moddata,schematics,server.properties,whitelist.json,ops.json"
-).split(",") if t.strip()]
-CONFIG_EXCLUDES = tuple(e for e in os.environ.get("CONFIG_EXCLUDES", "config/fancymenu,config/spark").split(",") if e.strip())
+))
+CONFIG_EXCLUDES = tuple(csv_list(os.environ.get("CONFIG_EXCLUDES", "config/fancymenu,config/spark")))
 REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive:mc-backups")
 REMOTE_MIN_AGE = os.environ.get("REMOTE_KEEP", "12h")
+REMOTE_TRASH_MIN_AGE = os.environ.get("REMOTE_TRASH_KEEP", "24h")
 
 TOKEN = os.environ["DISCORD_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
@@ -42,9 +51,6 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 
 TPS_COMMAND = os.environ.get("TPS_COMMAND", "")
 TPS_CANDIDATES = ("neoforge tps", "forge tps", "tps")
-
-ANSI = re.compile(r"\x1b\[[0-9;]*m|§.")
-SPARK_URL = re.compile(r"https://spark\.lucko\.me/(?!docs)\S+")
 
 
 def detect_world():
@@ -58,6 +64,7 @@ def detect_world():
 
 
 WORLD_DIR = os.environ.get("WORLD_DIR") or detect_world()
+WORLD_TARGETS = csv_list(os.environ.get("WORLD_TARGETS", ""))
 
 
 def rcon(cmd):
@@ -165,6 +172,25 @@ def rclone_prune(sub):
     )
 
 
+def rclone_prune_trash(sub):
+    if REMOTE_TRASH_MIN_AGE.lower() in {"", "0", "false", "off", "none"}:
+        return
+    subprocess.run(
+        [
+            "rclone", "delete", f"{REMOTE}/{sub}/",
+            "--drive-trashed-only",
+            "--drive-use-trash=false",
+            "--min-age", REMOTE_TRASH_MIN_AGE,
+        ],
+        capture_output=True, text=True, timeout=120,
+    )
+
+
+def rclone_prune_all(sub):
+    rclone_prune(sub)
+    rclone_prune_trash(sub)
+
+
 def load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
@@ -208,6 +234,114 @@ def make_config_tar():
     return path
 
 
+def default_world_targets():
+    targets = [WORLD_DIR]
+    for extra in (f"{WORLD_DIR}_nether", f"{WORLD_DIR}_the_end"):
+        if (SERVER / extra).exists():
+            targets.append(extra)
+    return targets
+
+
+def checked_world_targets():
+    targets = WORLD_TARGETS or default_world_targets()
+    checked = []
+    seen = set()
+    for target in targets:
+        p = Path(target)
+        if p.is_absolute() or ".." in p.parts:
+            raise RuntimeError(f"world target `{target}` must be relative to SERVER_DIR")
+        if target in seen:
+            continue
+        seen.add(target)
+        checked.append(target)
+    return checked
+
+
+def zip_dir_entry(zf, path, arcname, written):
+    name = arcname.as_posix().rstrip("/") + "/"
+    if name in written:
+        return
+    mtime = max(path.stat().st_mtime, 315532800)
+    info = zipfile.ZipInfo(name, time.localtime(mtime)[:6])
+    info.external_attr = (0o40755 & 0xFFFF) << 16
+    zf.writestr(info, b"")
+    written.add(name)
+
+
+def stat_key(path):
+    st = path.stat()
+    return st.st_dev, st.st_ino
+
+
+def rel_error_path(path):
+    try:
+        return str(Path(path).relative_to(SERVER))
+    except (TypeError, ValueError):
+        return str(path)
+
+
+def write_backup_tree(zf, target, written):
+    root = SERVER / target
+    if not root.exists():
+        raise RuntimeError(f"world target `{target}` does not exist")
+    if not root.is_dir():
+        raise RuntimeError(f"world target `{target}` is not a directory")
+
+    errors = []
+    copied = 0
+    seen_dirs = set()
+    try:
+        seen_dirs.add(stat_key(root))
+        zip_dir_entry(zf, root, root.relative_to(SERVER), written)
+    except OSError as e:
+        raise RuntimeError(f"cannot read world target `{target}`: {e}") from e
+
+    def walk_error(e):
+        errors.append(f"{rel_error_path(e.filename)}: {e}")
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=True, onerror=walk_error):
+        current = Path(dirpath)
+        try:
+            zip_dir_entry(zf, current, current.relative_to(SERVER), written)
+        except OSError as e:
+            errors.append(f"{current.relative_to(SERVER)}: {e}")
+            dirnames[:] = []
+            continue
+
+        keep_dirs = []
+        for name in sorted(dirnames):
+            child = current / name
+            try:
+                key = stat_key(child)
+                if key in seen_dirs:
+                    continue
+                seen_dirs.add(key)
+                keep_dirs.append(name)
+            except OSError as e:
+                errors.append(f"{child.relative_to(SERVER)}: {e}")
+        dirnames[:] = keep_dirs
+
+        for name in sorted(filenames):
+            f = current / name
+            if f.name == "session.lock" or f.suffix == ".tmp":
+                continue
+            try:
+                arcname = f.relative_to(SERVER).as_posix()
+                if arcname in written:
+                    continue
+                zf.write(f, arcname)
+                written.add(arcname)
+                copied += 1
+            except OSError as e:
+                errors.append(f"{f.relative_to(SERVER)}: {e}")
+
+    if errors:
+        sample = "; ".join(errors[:10])
+        more = f"; and {len(errors) - 10} more" if len(errors) > 10 else ""
+        raise RuntimeError(f"world backup skipped unreadable paths: {sample}{more}")
+    return copied
+
+
 def make_world_backup():
     TMP.mkdir(exist_ok=True)
     BACKUP_DIR.mkdir(exist_ok=True)
@@ -219,15 +353,18 @@ def make_world_backup():
         time.sleep(2)
         stamp = time.strftime("%Y-%m-%d-%H-%M-%S")
         tmp_path = TMP / f"world-{stamp}.zip"
-        world = SERVER / WORLD_DIR
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in sorted(world.rglob("*")):
-                if not f.is_file() or f.name == "session.lock" or f.suffix == ".tmp":
-                    continue
-                try:
-                    zf.write(f, f.relative_to(SERVER))
-                except OSError:
-                    pass
+        targets = checked_world_targets()
+        copied = 0
+        written = set()
+        try:
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for target in targets:
+                    copied += write_backup_tree(zf, target, written)
+            if copied == 0:
+                raise RuntimeError(f"world backup found no files in: {', '.join(targets)}")
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
         final = BACKUP_DIR / tmp_path.name
         shutil.move(tmp_path, final)
         return final
@@ -248,6 +385,38 @@ def last_backup_age():
     if not zips:
         return None, None
     return zips[-1], time.time() - zips[-1].stat().st_mtime
+
+
+def backup_report(path):
+    with zipfile.ZipFile(path) as zf:
+        names = zf.namelist()
+
+    files = [n for n in names if not n.endswith("/")]
+    level = [n for n in files if n.endswith("/level.dat")]
+    playerdata = [n for n in files if "/playerdata/" in n and n.endswith(".dat")]
+    stats = [n for n in files if "/stats/" in n and n.endswith(".json")]
+    advancements = [n for n in files if "/advancements/" in n and n.endswith(".json")]
+    regions = [n for n in files if "/region/" in n and n.endswith(".mca")]
+    dimension_dirs = sorted({
+        n.split("/dimensions/", 1)[1].split("/", 2)[0] + "/" + n.split("/dimensions/", 1)[1].split("/", 2)[1]
+        for n in names
+        if "/dimensions/" in n and len(n.split("/dimensions/", 1)[1].split("/", 2)) >= 2
+    })
+
+    lines = [
+        f"`{path.name}` ({mb(path.stat().st_size)})",
+        f"Files: {len(files)}",
+        f"level.dat: {len(level)}",
+        f"playerdata: {len(playerdata)}",
+        f"stats: {len(stats)}",
+        f"advancements: {len(advancements)}",
+        f"region chunks: {len(regions)}",
+    ]
+    if dimension_dirs:
+        dims = ", ".join(dimension_dirs[:12])
+        more = f", +{len(dimension_dirs) - 12} more" if len(dimension_dirs) > 12 else ""
+        lines.append(f"dimensions: {dims}{more}")
+    return "\n".join(lines)
 
 
 def mb(n):
@@ -308,25 +477,33 @@ async def watcher():
                 uploaded_any = True
             except subprocess.CalledProcessError as e:
                 await channel.send(f"Drive upload failed for `{z.name}`: ```{(e.stderr or '')[-500:]}```")
+                continue
             state["uploaded"].append(z.name)
             save_state(state)
         if uploaded_any:
-            await asyncio.to_thread(rclone_prune, "world")
+            await asyncio.to_thread(rclone_prune_all, "world")
         sig = await asyncio.to_thread(config_sig)
         if sig != state.get("config_sig"):
-            tar = await asyncio.to_thread(make_config_tar)
-            size = tar.stat().st_size
-            await asyncio.to_thread(rclone_up, tar, "config")
-            link = await asyncio.to_thread(rclone_link, "config", tar.name)
-            label = f"[`{tar.name}`](<{link}>)" if link else f"`{tar.name}`"
-            note = f"Config changed: {label} ({mb(size)}) uploaded to Drive"
-            if size <= channel.guild.filesize_limit - 524288:
-                await channel.send(content=note, file=discord.File(tar))
-            else:
-                await channel.send(note)
-            tar.unlink()
-            state["config_sig"] = sig
-            save_state(state)
+            tar = None
+            try:
+                tar = await asyncio.to_thread(make_config_tar)
+                size = tar.stat().st_size
+                await asyncio.to_thread(rclone_up, tar, "config")
+                link = await asyncio.to_thread(rclone_link, "config", tar.name)
+                label = f"[`{tar.name}`](<{link}>)" if link else f"`{tar.name}`"
+                note = f"Config changed: {label} ({mb(size)}) uploaded to Drive"
+                if size <= channel.guild.filesize_limit - 524288:
+                    await channel.send(content=note, file=discord.File(tar))
+                else:
+                    await channel.send(note)
+                state["config_sig"] = sig
+                save_state(state)
+                await asyncio.to_thread(rclone_prune_all, "config")
+            except subprocess.CalledProcessError as e:
+                await channel.send(f"Config upload failed: ```{(e.stderr or '')[-500:]}```")
+            finally:
+                if tar:
+                    tar.unlink(missing_ok=True)
     except Exception as e:
         print(f"watcher error: {e!r}", flush=True)
 
@@ -460,6 +637,23 @@ async def backups_cmd(interaction: discord.Interaction):
         return
     lines = [f"`{z.name}` — {mb(z.stat().st_size)}" for z in zips]
     await interaction.response.send_message("\n".join(lines))
+
+
+@tree.command(name="backupcheck", description="Inspect the newest local backup zip")
+async def backupcheck_cmd(interaction: discord.Interaction):
+    if interaction.user.id != OWNER_ID:
+        await interaction.response.send_message("Not allowed.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    z, _ = last_backup_age()
+    if not z:
+        await interaction.followup.send("No local backup zip found.", ephemeral=True)
+        return
+    try:
+        report = await asyncio.to_thread(backup_report, z)
+        await interaction.followup.send(f"```\n{report[:1900]}\n```", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Backup check failed: ```{str(e)[:500]}```", ephemeral=True)
 
 
 @bot.event
